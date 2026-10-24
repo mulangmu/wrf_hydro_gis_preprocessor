@@ -2624,7 +2624,8 @@ def build_RouteLink(RoutingNC, order, From_To, NodeElev, NodesLL, NodesXY, Lengt
         gage_strs = [gageDict.get(arcid, '').rjust(15) for arcid in order]
     else:
         gage_strs = [' ' * 15] * len(order)
-    Gages[:,:] = netCDF4.stringtochar(numpy.array(gage_strs, dtype='S15'))
+    #Gages[:,:] = netCDF4.stringtochar(numpy.array(gage_strs, dtype='S15'))
+    Gages[:,:] = netCDF4.stringtochar(numpy.array(gage_strs, dtype='S15'), encoding='ascii')
 
     # Close file
     rootgrp.close()
@@ -3593,9 +3594,9 @@ def nlinks_checker(rootgrp_FD,
 
 def group_min(l, g):
     '''Function for gathering minimum value from a set of groups'''
-    groups = defaultdict(int)                                                   # default value of int is 0
+    groups = {}                                                                  # Plain dict; membership test avoids the 0-as-sentinel bug
     for li, gi in zip(l, g):
-        if li <= groups[gi] or groups[gi]==0:
+        if gi not in groups or li < groups[gi]:
             groups[gi] = li
     return groups
 
@@ -3910,6 +3911,8 @@ def Lake_Link_Type(FLWBarr, FromComIDs, FLarr, subset=None, LakeAssociation=Lake
 
         # Get initial lake information, including adding looping outflows
         Lake_LinksList, inflows, SegVals, SegVals2, ups, newLakeLinks = get_lake_routing_info(FLWBarr, LakeID, Lake_LinkDict, accum_val, FromComIDs, FromSegs, LakeAssociation=LakeAssociation)
+        # Record newly found loop-back link:lake associations so later downstream checks see them
+        Lake_LinkDict.update(newLakeLinks)
         if debug:
             print('          Lake {0} has {1} links, {2} inflows, and {3} upstream flowlines.'.format(LakeID, len(Lake_LinksList), len(inflows), len(ups)))
             print('          Lake {0} has {1} inflows: {2}'.format(LakeID, len(inflows), inflows))
@@ -3959,7 +3962,11 @@ def Lake_Link_Type(FLWBarr, FromComIDs, FLarr, subset=None, LakeAssociation=Lake
             for item in to_alter:
                 problem_lakes = set_problem(problem_lakes, LakeID, 'Upstream segment for {0} belongs to another lake [{1}]'.format(LakeID, item))
             FLWBarr[LakeAssociation][numpy.in1d(FLWBarr[LakeAssociation], numpy.array(to_alter))] = LakeID  # Change all the IDs of the upstream lakes at once to the current lake ID
+            # Refresh link:lake dictionary after merging so check_downstream compares against the new labels
+            Lake_LinkDict = {item[FLID]:item[LakeAssociation] for item in FLWBarr}
             Lake_LinksList, inflows, SegVals, SegVals2, ups, newLakeLinks = get_lake_routing_info(FLWBarr, LakeID, Lake_LinkDict, accum_val, FromComIDs, FromSegs, LakeAssociation=LakeAssociation)
+            # Record newly found loop-back link:lake associations so later downstream checks see them
+            Lake_LinkDict.update(newLakeLinks)
         Lake_LinksList2 = Lake_LinksList + inflows.tolist()                     # Add all lake links to all inflows
         if debug:
             print('          Lake {0} now has {1} links: {2}'.format(LakeID, len(Lake_LinksList2), Lake_LinksList2))
@@ -4133,12 +4140,25 @@ def Lake_Link_Type(FLWBarr, FromComIDs, FLarr, subset=None, LakeAssociation=Lake
     print('        Examined {0} lakes in {1:3.2f} seconds.'.format(len(seen), time.time()-tic1))
     return Lake_Link_Type_arr, problem_lakes, seen, ChainedLakes, Old_New_LakeComID, FLWBarr, Remove_Association, Tossed_Lake_Link_Type_arr
 
-def Waterbody_SpatialJoin(in_RL, in_Lakes, link_ID_field, lake_ID_field, quiet=True):
+def Waterbody_SpatialJoin(in_RL, in_Lakes, link_ID_field, lake_ID_field, quiet=True, join_method='point', in_streams=None):
     '''
     3/28/2023
     This function performs a simple intersection between the flowline midpoint
     geometry defined in RouteLink.nc and the waterbodies. The output is a dictionary
     of waterbodies that intersect each flowline midpoint.
+
+    join_method == 'point' (default):
+        Original behavior: a link is associated with a lake when the link's start-node
+        point (lat/lon in RouteLink.nc) falls within the lake polygon.
+        NOTE (10/2026): for netCDF inputs the point layer is now built directly from the
+        'lat'/'lon' variables instead of ogr.Open(in_RL). GDAL's netCDF vector driver
+        builds geometry from the projected x/y variables (meters) while reporting a
+        geographic (degree) layer SRS, so the lake reprojection below placed lakes in
+        degree-space against meter-space points and every join silently came back empty.
+    join_method == 'line':
+        A link is associated with a lake when the reach polyline (streams shapefile,
+        same projection as the lakes) intersects the lake polygon. This catches
+        reservoirs that sit mid-reach, where no reach start-node falls inside the lake.
     '''
 
     tic1 = time.time()
@@ -4153,14 +4173,75 @@ def Waterbody_SpatialJoin(in_RL, in_Lakes, link_ID_field, lake_ID_field, quiet=T
     lake_fieldNames = [lakes_LayerDef.GetFieldDefn(i).GetName() for i in range(lakes_LayerDef.GetFieldCount())]
     assert lake_ID_field in lake_fieldNames
 
-    # Open the RouteLink as points
-    link_ds = ogr.Open(in_RL, 0)
-    link_lyr = link_ds.GetLayerByIndex(0)
-    link_srs = link_lyr.GetSpatialRef()
-    link_LayerDef = link_lyr.GetLayerDefn()
-    print('    Input RouteLink layer has {0} features.'.format(link_lyr.GetFeatureCount()))
-    link_fieldNames = [link_LayerDef.GetFieldDefn(i).GetName() for i in range(link_LayerDef.GetFieldCount())]
-    assert link_ID_field in link_fieldNames
+    if join_method == 'line':
+        # Open the stream reach polylines (same projection as the lakes layer)
+        assert in_streams is not None and os.path.exists(in_streams), \
+            'join_method="line" requires the streams shapefile: {0}'.format(in_streams)
+        link_ds = ogr.Open(in_streams, 0)
+        link_lyr = link_ds.GetLayerByIndex(0)
+        link_srs = link_lyr.GetSpatialRef()
+        link_LayerDef = link_lyr.GetLayerDefn()
+        print('    Input RouteLink layer has {0} features (stream polylines).'.format(link_lyr.GetFeatureCount()))
+        link_fieldNames = [link_LayerDef.GetFieldDefn(i).GetName() for i in range(link_LayerDef.GetFieldCount())]
+        assert link_ID_field in link_fieldNames
+    elif in_RL.lower().endswith('.nc'):
+        # Build the point layer directly from the netCDF coordinates (see docstring).
+        # Prefer the projected x/y variables: both x/y and the lakes layer are written in the
+        # model (fine_grid) projection, so points built from x/y sit in the lakes' own
+        # coordinate space with no reprojection at all. The stored lat/lon come from
+        # bilinear interpolation of the coarse geogrid coordinates and can deviate from
+        # x/y by kilometers, so they are only used as a fallback.
+        rl_rootgrp = netCDF4.Dataset(in_RL, 'r')
+        rl_links = rl_rootgrp.variables[link_ID_field][:]
+        if 'x' in rl_rootgrp.variables and 'y' in rl_rootgrp.variables:
+            rl_x = rl_rootgrp.variables['x'][:]
+            rl_y = rl_rootgrp.variables['y'][:]
+            coords_are_projected = True
+        else:
+            rl_lons = rl_rootgrp.variables['lon'][:]
+            rl_lats = rl_rootgrp.variables['lat'][:]
+            coords_are_projected = False
+        rl_rootgrp.close()
+        link_ds = ogr.GetDriverByName('MEMORY').CreateDataSource('routelink_points')
+        if coords_are_projected:
+            link_srs = lakes_srs.Clone()                                           # x/y share the lakes' (model) projection
+        else:
+            link_srs = osr.SpatialReference()
+            link_srs.ImportFromEPSG(4326)                                          # Fallback: lat/lon are geographic degrees
+        link_lyr = link_ds.CreateLayer('links', link_srs, ogr.wkbPoint)
+        link_lyr.CreateField(ogr.FieldDefn(link_ID_field, ogr.OFTInteger))
+        if coords_are_projected:
+            for link_id, xx, yy in zip(rl_links, rl_x, rl_y):
+                feat = ogr.Feature(link_lyr.GetLayerDefn())
+                feat.SetField(link_ID_field, int(link_id))
+                pt = ogr.Geometry(ogr.wkbPoint)
+                pt.AddPoint_2D(float(xx), float(yy))
+                feat.SetGeometry(pt)
+                link_lyr.CreateFeature(feat)
+                feat = pt = None
+            print('    Input RouteLink layer has {0} features (start nodes from projected x/y).'.format(link_lyr.GetFeatureCount()))
+        else:
+            for link_id, lon, lat in zip(rl_links, rl_lons, rl_lats):
+                feat = ogr.Feature(link_lyr.GetLayerDefn())
+                feat.SetField(link_ID_field, int(link_id))
+                pt = ogr.Geometry(ogr.wkbPoint)
+                pt.AddPoint_2D(float(lon), float(lat))
+                feat.SetGeometry(pt)
+                link_lyr.CreateFeature(feat)
+                feat = pt = None
+            print('    Input RouteLink layer has {0} features (start nodes from lat/lon).'.format(link_lyr.GetFeatureCount()))
+        link_LayerDef = link_lyr.GetLayerDefn()
+        link_fieldNames = [link_LayerDef.GetFieldDefn(i).GetName() for i in range(link_LayerDef.GetFieldCount())]
+        assert link_ID_field in link_fieldNames
+    else:
+        # Open the RouteLink as points
+        link_ds = ogr.Open(in_RL, 0)
+        link_lyr = link_ds.GetLayerByIndex(0)
+        link_srs = link_lyr.GetSpatialRef()
+        link_LayerDef = link_lyr.GetLayerDefn()
+        print('    Input RouteLink layer has {0} features.'.format(link_lyr.GetFeatureCount()))
+        link_fieldNames = [link_LayerDef.GetFieldDefn(i).GetName() for i in range(link_LayerDef.GetFieldCount())]
+        assert link_ID_field in link_fieldNames
 
     # Added 11/19/2020 to allow for GDAL 3.0 changes to the order of coordinates in transform
     if int(osgeo.__version__[0]) >= 3:
@@ -4169,8 +4250,9 @@ def Waterbody_SpatialJoin(in_RL, in_Lakes, link_ID_field, lake_ID_field, quiet=T
         link_srs.SetAxisMappingStrategy(osgeo.osr.OAMS_TRADITIONAL_GIS_ORDER)
 
     # Check if a coordinate transformation (projection) must be performed
+    trans = False
     if not lakes_srs.IsSame(link_srs):
-        print('    Input shapefile projection does not match requested output. Transformatin will be applied to lakes.')
+        print('    Input shapefile projection does not match requested output. Transform will be applied to lakes.')
         coordTrans = osr.CoordinateTransformation(lakes_srs, link_srs)
         trans = True
 
@@ -4181,7 +4263,7 @@ def Waterbody_SpatialJoin(in_RL, in_Lakes, link_ID_field, lake_ID_field, quiet=T
 
         lake_id = lake_feature.GetField(lake_ID_field)
         counter += 1
-        lake_geometry = lake_feature.GetGeometryRef()
+        lake_geometry = lake_feature.GetGeometryRef().Clone()                     # Clone so the in-place transform cannot mutate the layer's cached geometry
         polygon_area = lake_geometry.GetArea()
         if not quiet:
             print('        Input Lake [{0}] area: {1}.'.format(lake_id, polygon_area))
@@ -4199,9 +4281,14 @@ def Waterbody_SpatialJoin(in_RL, in_Lakes, link_ID_field, lake_ID_field, quiet=T
         for link_feature in link_lyr:
             link_id = link_feature.GetField(link_ID_field)
             link_geom = link_feature.GetGeometryRef()
-            if link_geom.Within(lake_geometry):
-                point_counter += 1
-                WaterbodyDict[link_id] = [lake_id]
+            if join_method == 'line':
+                if link_geom.Intersects(lake_geometry):
+                    point_counter += 1
+                    WaterbodyDict[link_id] = [lake_id]
+            else:
+                if link_geom.Within(lake_geometry):
+                    point_counter += 1
+                    WaterbodyDict[link_id] = [lake_id]
             link_feature = link_geom = None
             del link_feature, link_id, link_geom
         if not quiet:
@@ -4222,7 +4309,7 @@ def Waterbody_SpatialJoin(in_RL, in_Lakes, link_ID_field, lake_ID_field, quiet=T
     print('    Finished intersecting flowline network with waterbodies in {0:3.2f}s'.format(time.time()-tic1))
     return WaterbodyDict
 
-def LK_main(outDir, Flowline, Waterbody, link_ID_field, lake_ID_field, Subset_arr=None, datestr=datestr, LakeAssociation=LakeAssoc, update_RL=True, update_LK=True):
+def LK_main(outDir, Flowline, Waterbody, link_ID_field, lake_ID_field, Subset_arr=None, datestr=datestr, LakeAssociation=LakeAssoc, update_RL=True, update_LK=True, join_method='point'):
     '''
     This is the main lake pre-processing function, but written for open-source GIS pre-processing
 
@@ -4234,6 +4321,8 @@ def LK_main(outDir, Flowline, Waterbody, link_ID_field, lake_ID_field, Subset_ar
     Subset_arr          A numpy array with which to subset the lake list
     datestr             A string giving the current date, for file naming
     LakeAssociation     The fielname to use for ???
+    join_method         'point' = associate links by start-node point-in-lake (default);
+                        'line' = associate links whose reach polyline intersects the lake polygon.
     '''
 
     # Setup Logging
@@ -4243,7 +4332,9 @@ def LK_main(outDir, Flowline, Waterbody, link_ID_field, lake_ID_field, Subset_ar
     if Flowline is not None:
         # This is the normal case. The user wishes to evaluate flowline:waterbody associations for either a flowline feature class
         # which has the associations specified, or perform a spatial join between those flowlines and a Waterbody feature class.
-        WaterbodyDict = Waterbody_SpatialJoin(Flowline, Waterbody, link_ID_field, lake_ID_field, quiet=True)
+        WaterbodyDict = Waterbody_SpatialJoin(Flowline, Waterbody, link_ID_field, lake_ID_field, quiet=True,
+                                              join_method=join_method,
+                                              in_streams=os.path.join(outDir, streams_vector))
     elif isinstance(Waterbody, dict):
         # This is the case where the user is only wishing to submit a dictionary of flowline:waterbody associations for evaluation
         # Thus, choose Flowline=None and Waterbody=WaterbodyDict in the main() function arguments.
@@ -4393,8 +4484,10 @@ def obtain_LakeParameters(in_NC, subsetList=None):
     # Assemble dictionaries
     IDs = ncVars['lake_id'][:]
 
-    # If no subset list is given, use all IDs
-    if not subsetList:
+    # If no subset list is given, use all IDs.
+    # Note: an empty list must be honored as a subset (zero lakes), so only
+    # fall back to all IDs when the caller passed no list at all.
+    if subsetList is None:
         subsetList = IDs.tolist()
 
     # Must convert square kilometers in input file back to square meters before going into build_LAKEPARM function

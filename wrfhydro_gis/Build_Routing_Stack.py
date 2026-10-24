@@ -187,7 +187,8 @@ def GEOGRID_STANDALONE(inGeogrid,
                         retdeprtfac_val = 1.0,
                         lksatfac_val = 1000.0,
                         startPts = None,
-                        channel_mask = None):
+                        channel_mask = None,
+                        lake_join = 'point'):
     '''
     This function will validate input parameters and attempt to run the full routing-
     stack GIS pre-processing for WRF-Hydro. The inputs will be related to the domain,
@@ -369,7 +370,8 @@ def GEOGRID_STANDALONE(inGeogrid,
                                                                                     lake_ID_field,
                                                                                     Subset_arr=None,
                                                                                     datestr=wrfh.datestr,
-                                                                                    LakeAssociation=wrfh.LakeAssoc,)
+                                                                                    LakeAssociation=wrfh.LakeAssoc,
+                                                                                    join_method=lake_join)
                 del WaterbodyDict, Lake_Link_Type_arr, Old_New_LakeComID
 
     # Check for NLINKS channel connectivity errors (added by KMS 3/27/2023)
@@ -483,6 +485,12 @@ if __name__ == '__main__':
                         type=lambda x: is_valid_file(parser, x),
                         default=None,
                         help="Path to a routing grid raster with which to mask channels and channel-derived grids [OPTIONAL]")
+    parser.add_argument("--lake-join",
+                        dest="lake_join",
+                        type=str,
+                        choices=['point', 'line'],
+                        default='point',
+                        help="Lake-flowline association method: 'point' = link start-node point falls inside lake (original behavior); 'line' = reach polyline intersects lake polygon (catches lakes sitting mid-reach). default=point")
 
     # If no arguments are supplied, print help message
     if len(sys.argv)==1:
@@ -551,6 +559,7 @@ if __name__ == '__main__':
         print('    Input channel initiation start point feature class: {0}'.format(args.channel_starts))
         print('    Input groundwater basin polygons: {0}'.format(args.gw_polys))
         print('    Input channelgrid mask raster: {0}'.format(args.ch_mask))
+        print('    Lake-flowline association method: {0}'.format(args.lake_join))
         print('    Output ZIP file: {0}'.format(args.out_zip_file))
 
         # Create scratch directory for temporary outputs
@@ -579,7 +588,8 @@ if __name__ == '__main__':
                             retdeprtfac_val = args.retdeprtfac_val,
                             lksatfac_val = default_lksatfac_val,
                             startPts = args.channel_starts,
-                            channel_mask = args.ch_mask)
+                            channel_mask = args.ch_mask,
+                            lake_join = args.lake_join)
         tee.close()
         del tee
     else:
