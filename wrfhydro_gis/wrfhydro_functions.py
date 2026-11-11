@@ -3180,19 +3180,32 @@ def add_reservoirs(rootgrp, projdir, fac, in_lakes, grid_obj, lakeIDfield=None, 
         print('    Found {0} lakes on active channels. Lost {1} lakes that were not on active channels.'.format(new_Lk_count, old_Lk_count-new_Lk_count))
         del Lk_chan, old_Lk_count, new_Lk_count
 
+        # Renumber retained lakes to contiguous 1...n ids. Upstream leaves the
+        # original ids, so every dropped lake opens a gap: WRF-Hydro takes
+        # NLAKES = max(LAKEGRID) and then aborts reading LAKEPARM.nc, which has
+        # one row per retained lake. Everything carrying a lake id must be
+        # remapped together: the raster, the surviving-id list, and the
+        # id-keyed dicts built before this filter.
+        lake_uniques = numpy.sort(lake_uniques)
+        remap = {int(old): new + 1 for new, old in enumerate(lake_uniques)}
+        for old, new in remap.items():        # ascending: each new id is below every
+            Lake_arr[Lake_arr == old] = new   # unprocessed old id, no double remap
+        lake_uniques = numpy.array(list(remap.values()))
+        areas    = {remap[k]: v for k, v in areas.items()    if k in remap}
+        cen_lats = {remap[k]: v for k, v in cen_lats.items() if k in remap}
+        cen_lons = {remap[k]: v for k, v in cen_lons.items() if k in remap}
+        lakeIDList = list(areas.keys())
+        print('    Renumbered {0} retained lakes to ids 1...{0}'.format(len(remap)))
+
         # Reset the 1...n index and eliminate lakes from shapefile that were eliminated here
-        #num = 1                                                                 # Initialize the lake ID counter
         print('    Removing lakes not on gridded channel network')
         for feature in lake_layer:
             idval = feature.GetField(lakeID)
-            if idval not in lake_uniques.tolist():
-                #print('      Removing lake: {0}'.format(idval))
+            if idval not in remap:
                 lake_layer.DeleteFeature(feature.GetFID())
             else:
-                #feature.SetField(lakeID, num)      # Add an area field to re-calculate area
-                #lake_layer.SetFeature(feature)
-                #num += 1
-                pass
+                feature.SetField(lakeID, remap[idval])   # keep newID == LAKEGRID id
+                lake_layer.SetFeature(feature)
         lake_layer.ResetReading()
     lake_ds = lake_layer = None
 
